@@ -6,11 +6,21 @@ import org.apache.spark.sql.functions._
 import warehouse.models.{Amount, Position}
 import warehouse.spark.LastValueByTimestamp
 
-object Warehouse {
-  type PositionStatistics = (Long, java.math.BigDecimal, java.math.BigDecimal, java.math.BigDecimal, java.math.BigDecimal)
+import scala.reflect.io.Path
 
-  val positionsPath: String = locateResource("/positions.csv")
-  val amountsPath: String = locateResource("/amounts.csv")
+object Warehouse {
+  val POSITIONS_PATH = "/positions.csv"
+  val AMOUNTS_PATH = "/amounts.csv"
+
+  val SAVE_CURRENT_AMOUNTS_PATH = "current_amounts.csv"
+  val SAVE_MAX_MIN_AVG_PATH = "max_min_avg.csv"
+
+  Seq(SAVE_CURRENT_AMOUNTS_PATH, SAVE_MAX_MIN_AVG_PATH).foreach { path =>
+    Path(path).deleteRecursively()
+  }
+
+  val positionsPath: String = locateResource(POSITIONS_PATH)
+  val amountsPath: String = locateResource(AMOUNTS_PATH)
 
   val spark: SparkSession =
     SparkSession
@@ -27,20 +37,50 @@ object Warehouse {
       val positionsDS: Dataset[Position] = readCsv(positionsPath, Position.schema, Position.apply)
       val amountsDS: Dataset[Amount] = readCsv(amountsPath, Amount.schema, Amount.apply)
 
-      // Find the current amount for each position, warehouse, product.
-      // Find max, min, avg amounts for each warehouse and product.
+      //region Find the current amount for each position, warehouse, product.
 
-      val statistics = amountStatistics(amountsDS)
+      val curAmounts = currentAmounts(amountsDS)
 
-      val joined = positionsDS.joinWith(statistics,  positionsDS("positionId") === statistics("value"))
+      val positionWithCurrentAmount = positionsDS
+        .joinWith(curAmounts,  positionsDS("positionId") === curAmounts("value"))
+        .cache()
 
-      joined.write.csv("current_amounts.csv")
-      joined.write.csv("max_min_avg_amounts.csv")
+      val result1 = positionWithCurrentAmount
+        .map { case (position, (_, currentAmount)) =>
+          (position.positionId, position.warehouse, position.product, currentAmount)
+        }
+      //endregion
 
-    } catch {
-      case e: Throwable => println(e)
+      positionWithCurrentAmount.show()
+
+      //region Find max, min, avg amounts for each warehouse and product
+
+      val result2 = positionWithCurrentAmount
+        .groupByKey { case (position, _) => position.warehouse -> position.product }
+        .agg(
+          avg(positionWithCurrentAmount("_2.currentAmount"))
+            .name("avg")
+            .cast(DecimalType(38, 18)) // have to do custom casting for avg
+            .as[java.math.BigDecimal],
+          min(positionWithCurrentAmount("_2.currentAmount"))
+            .name("min")
+            .as[java.math.BigDecimal],
+          max(positionWithCurrentAmount("_2.currentAmount"))
+            .name("max")
+            .as[java.math.BigDecimal]
+        )
+        .map { case ((a, b), c, d, e) =>
+          (a, b, c, d, e)
+        }
+      //endregion
+
+      result2.show()
+
+      // saving
+      result1.write.csv(SAVE_CURRENT_AMOUNTS_PATH)
+      result2.write.csv(SAVE_MAX_MIN_AVG_PATH)
+
     } finally {
-      Thread.sleep(100000000)
       spark.stop()
     }
   }
@@ -59,26 +99,14 @@ object Warehouse {
       .cache()
   }
 
-  def amountStatistics(amounts: Dataset[Amount]): Dataset[PositionStatistics] = {
-    val defaultSparkDecimalDT = DecimalType(38, 18)
-    val lastValueByTimestamp = LastValueByTimestamp(defaultSparkDecimalDT)
+  def currentAmounts(amounts: Dataset[Amount]): Dataset[(Long, java.math.BigDecimal)] = {
+    val lastValueByTimestamp = LastValueByTimestamp(DecimalType(38, 18))
     amounts
       .groupByKey(_.positionId)
       .agg(
-        avg("amount")
-          .name("avg")
-          .cast(defaultSparkDecimalDT) // have to do custom casting for avg
-          .as[java.math.BigDecimal],
-        min("amount")
-          .name("min")
-          .as[java.math.BigDecimal],
-        max("amount")
-          .name("max")
-          .as[java.math.BigDecimal],
         lastValueByTimestamp($"amount", $"eventTime")
           .name("currentAmount")
           .as[java.math.BigDecimal]
       )
-      .cache()
   }
 }
