@@ -1,2 +1,5 @@
 .idea
 target
+generated_ds
+*.results
+custom.conf
